@@ -147,7 +147,7 @@ int mcu_gpio_read(int pin)
   return(digitalRead(pin));
 }
 
-int mcu_timer_read(void)
+unsigned long mcu_timer_read(void)
 {
   // read timer value and return as integer
   return(millis());
@@ -294,13 +294,13 @@ void es100_read_time(int dt_array[])
 // top level function to receive time from WWVB
 //------------------------------------------------------------------------------
 
-int es100_receive(int dt_array[])
+unsigned long es100_receive(int dt_array[])
 {
   // local variables
-  int         irq_status = 0;
-  int         current_timer_value;
-  int         count = 0;
-
+  int           irq_status = 0;
+  int           count = 0;
+  unsigned long current_timer_value;
+  
 
 
   // start reception
@@ -366,7 +366,7 @@ void setup()
 
 void loop() {
   // put your main code here, to run repeatedly:
-   int         current_timer_value;
+   unsigned long  current_timer_value;
    int         dt_array[DT_LENGTH];
 
   // receive time from WWVB
@@ -378,23 +378,23 @@ void loop() {
   Serial.print("-");
   if(dt_array[DT_MONTH] < 10)
     Serial.print("0");
-  Serial.print(dt_array[DT_MONTH], DEC);
+  Serial.print(dt_array[DT_MONTH], HEX);
   Serial.print("-");
   if(dt_array[DT_DAY] < 10)
     Serial.print("0");
-  Serial.print(dt_array[DT_DAY], DEC);
+  Serial.print(dt_array[DT_DAY], HEX);
   Serial.print(" ");
   if(dt_array[DT_HOUR] < 10)
     Serial.print("0");
-  Serial.print(dt_array[DT_HOUR], DEC);
+  Serial.print(dt_array[DT_HOUR], HEX);
   Serial.print(":");
   if(dt_array[DT_MINUTE] < 10)
     Serial.print("0");
-  Serial.print(dt_array[DT_MINUTE], DEC);
+  Serial.print(dt_array[DT_MINUTE], HEX);
   Serial.print(":");
   if(dt_array[DT_SECOND] < 10)
     Serial.print("0");
-  Serial.println(dt_array[DT_SECOND], DEC);
+  Serial.println(dt_array[DT_SECOND], HEX);
 
   // display timer value when second occurred
   Serial.print("second boundary occurred at timer count = ");
