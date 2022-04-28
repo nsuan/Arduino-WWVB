@@ -57,7 +57,7 @@
 #define utcSwitchPin   8       // Localtime/UTC selector switch digital input
 #define tz1SwitchPin   9       // TZ selector switch digital input
 #define tz2SwitchPin  10       // TZ selector switch digital input
-#define PPS_OUT       15       // PPS Output pin to MAX232 
+
 //Outputs
 #define ledMarkPin   LED_BUILTIN         // LED mark indicator digital output
 #define ledFramePin  LED_BUILTIN         // LED frame indicator digitaloutput
@@ -68,6 +68,10 @@
 #define WWVB_mark_millis  400  // Number of milliseconds before we assume a mark    (200ms)
 #define WWVB_split_millis 700  // Number of milliseconds before we assume a logic 1 (500ms=1,800ms=0)
 
+//PPS
+#define PPS_OUT       15       // PPS Output pin to MAX232 
+#define PPS_MS        200
+
 /* Definitions for the timer interrupt 2 handler
  * The Arduino runs at 16 Mhz, we use a prescaler of 64 -> We need to 
  * initialize the counter with 6. This way, we have 1000 interrupts per second.
@@ -75,7 +79,7 @@
  */
 #define INIT_TIMER_COUNT 6
 #define RESET_TIMER2 TCNT2 = INIT_TIMER_COUNT
-int tickCounter = 0;
+volatile int tickCounter = 0;
 
 // Time variables
 volatile byte ss;                        // seconds
@@ -98,10 +102,28 @@ byte previousSignalState;          // save previous receiver signal state
 int previousFlankTime;             // detected signal edge time
 int bufferPosition;                // buffer position counter
 unsigned long long wwvbRxBuffer;   // 64 bit data buffer to hold 60 bits decoded from WWVB
-int previousLowTime;               //last time we had 1 -> 0 transtion to figure out seconds
-bool doTick = false;               //flag to print the time
-bool interruptTick = true;         //stop interupt updates
 
+//Second marker handling
+int previousLowTime;               //last time we had 1 -> 0 transtion to figure out seconds
+bool interruptTick = true;         //stop interupt updates
+bool doTick = false;               //flag to print the time
+int tickDelta = 0;
+unsigned long tickTimestamp;
+
+//filtering
+
+int offsets[32];
+int offsetPtr = 0;
+/*long jitter;
+bool checkJitter = false; 
+*/ 
+
+//PPS handling
+int goodPPS = 0;
+bool didPPS = false;
+int ppsOffset = 0;
+int ppsOffsetAvg = 0;
+unsigned long ppsTimestamp = 0; 
 
 /* WWVB time format struct - acts as an overlay on wwvbRxBuffer to extract time/date data.
  * All this points to a 64 bit buffer wwvbRxBuffer that the bits get inserted into as the
@@ -190,7 +212,7 @@ void setup(void) {
   
   Serial.begin(9600);            // Serial communications for LCD display
   // UTC display inputs
- // pinMode(utcSwitchPin, INPUT);  // set pin mode input
+  // pinMode(utcSwitchPin, INPUT);  // set pin mode input
   //pinMode(tz1SwitchPin, INPUT);  // set pin mode input
   //pinMode(tz2SwitchPin, INPUT);  // set pin mode input
   //utcSwitchCheck();              // dip switch read during restart - display LocalTime/UTC
@@ -205,15 +227,31 @@ void setup(void) {
  **********************************************************************************/
 
 void loop(void) {
+  int offsetsum = 0;
   if (!clockStarted && ss != previousSecond) {    // upon seconds change
     serialDumpTime();            // print date, time and temp to serial
     previousSecond = ss;         // store previous second
   }
   if (doTick) {    // upon seconds change
-      serialDumpTime();            // print date, time and temp to serial
+      Serial.print("Tick: ");
+      Serial.print( tickDelta, DEC);
       doTick = false;
-      delay(180);
-      digitalWrite(PPS_OUT, LOW);  //reset PPS pin 
+      if(didPPS) {
+          offsets[offsetPtr] = ppsOffset;
+          offsetPtr++;
+          if(offsetPtr > 31) 
+            offsetPtr = 0;
+          for(int i = 0; i < 32 ; i++) 
+            offsetsum += offsets[i];
+          ppsOffsetAvg =  offsetsum / 32;
+          Serial.print("- (");
+          didPPS = false;
+          Serial.print( ppsOffset, DEC); 
+          Serial.print(" ");
+          Serial.print( ppsOffsetAvg, DEC);
+          Serial.print( ") -");
+      }
+      serialDumpTime();            // print date, time and temp to serial
 
   }
   if (wwvbSignalState != previousSignalState) {  // upon WWVB receiver signal change
@@ -268,20 +306,31 @@ void wwvbInit() {
 
 ISR(TIMER2_OVF_vect) {
   RESET_TIMER2;
-  tickCounter += 1;       // increment second
+  tickCounter += 1;
+  if(!didPPS) {
+       if(tickCounter == ppsOffset) {
+            digitalWrite(PPS_OUT, HIGH); 
+            ppsTimestamp = tickCounter;
+       }
+  }
+  //Advance clock
   //don't update these if WWWVB is going to update the clock
-  if (tickCounter == 1000 && interruptTick) {
+  //if we're in normal mode (no errors) advance ever 1000ms 
+  //if not try to use the averge second error to keep the clock stable
+  if (interruptTick && 
+  (errorCount < 10 && tickCounter == 1000) || 
+  (errorCount >= 10 && (tickCounter + ppsOffsetAvg) == 1000)) {
     ss++;
-    if (ss == 60  && interruptTick) {       // increment minute
+    if (interruptTick && ss == 60) {       // increment minute
       ss = 0;
       mm++;
-      if (mm == 60  && interruptTick) {     // increment hour
+      if (interruptTick && mm == 60) {     // increment hour
         mm = 0;
         hh++;
-        if (hh == 24  && interruptTick) {   // increment day
+        if (interruptTick && hh == 24) {   // increment day
           hh = 0;
           doy++;
-          if (doy == (366 + lyr)  && interruptTick) { // incr year
+          if (interruptTick && doy == (366 + lyr)) { // incr year
             doy = 1;
             year++;
           }
@@ -290,6 +339,9 @@ ISR(TIMER2_OVF_vect) {
     }
     tickCounter = 0;
   }
+  //Finally, kill the PPS singal 
+  if(tickCounter >= (ppsTimestamp + PPS_MS)) 
+    digitalWrite(PPS_OUT, LOW);
 }
 
 /***********************************************************************
@@ -300,18 +352,42 @@ ISR(TIMER2_OVF_vect) {
 
 void int0handler() {
   int curLowTime;
+
   // check the value again - since it takes some time to
   // activate the interrupt routine, we get a clear signal.
   wwvbSignalState = digitalRead(wwvbRxPin);         // read pulse level
 //  digitalWrite(ledRxPin, wwvbSignalState);          // change Rx indicator LED to match
   if (clockStarted && wwvbSignalState < previousSignalState) {    // upon seconds change
     curLowTime = millis();
-    if ( curLowTime - previousLowTime  >= 900) {
-      if( curLowTime - previousLowTime  >= 990 < 1010) 
-          digitalWrite(PPS_OUT, HIGH);
-      Serial.print("Tick: ");
-      Serial.print( (curLowTime - previousLowTime), DEC);
-      Serial.print(" ");
+    tickDelta = curLowTime - previousLowTime;
+    if (tickDelta  >= 900) {
+/*      offsets[offsetPtr] = tickCounter;
+      offsetPtr++;
+      if(offsetPtr > 32) {
+        offsetPtr = 0;
+        if(!checkJitter) 
+            checkJitter = true;
+      } */
+      if(tickDelta >= 980 && tickDelta < 1010) {
+          goodPPS++;
+          if(goodPPS > 3 && abs(tickCounter - ppsOffsetAvg) > (ppsOffsetAvg/2) ) {
+           if(tickCounter <= 500) {
+                 digitalWrite(PPS_OUT, HIGH);
+                 goodPPS = 0;
+                 didPPS = true;
+                 ppsTimestamp = tickCounter;
+                 ppsOffset = tickCounter; 
+           } else {
+                 //we're too late and the pulse needs to happen this time next second, actually.
+                 goodPPS = 0;
+                 didPPS = true;
+                 ppsTimestamp = (1000 - tickCounter);
+                 ppsOffset = (1000 - tickCounter);
+           }
+          }
+      } else {
+        goodPPS = 0;
+      }
       previousLowTime = curLowTime;
       doTick = true;        //tell main loop to print the clock 
     }
@@ -336,8 +412,9 @@ void int0handler() {
  *******************************************************************************************************/
 
 void scanSignal(void){ 
-   if(millis() % 1000 == 0) 
+   if(errorCount > 0 && tickCounter == 400 && ss == 35) {
      Serial.println(errorCount);
+   }
    if (wwvbSignalState == 1) {             // see if receiver input signal is still high
       int thisFlankTime=millis();          // retrieve current time
       previousFlankTime=thisFlankTime;     // add time to count
@@ -463,6 +540,8 @@ void finalizeBuffer(void) {
     hh = dhh;
   }
   interruptTick = true;
+  //reset ms to zero, we just started the minute  
+  tickCounter = 0;
   // Reset seconds to zero, buffer position counter to 63 and clear receive buffer
   ss             = 0;
   bufferPosition = 63;
@@ -544,62 +623,22 @@ void serialDumpTime(void) {
     Serial.print("Time: ");
     if (displayUTC == 1) {                   // display either UTC or local time
       if ((ss % 2) == 0) { 
-        sprintf(timeString, "%02d:%02d.%02d UTC ", hh, mm, ss);
+        sprintf(timeString, "%02d:%02d:%02d UTC ", hh, mm, ss);
       } else { 
-        sprintf(timeString, "%02d %02d.%02d UTC ", hh, mm, ss);
+        sprintf(timeString, "%02d %02d:%02d UTC ", hh, mm, ss);
       }
       Serial.println(timeString);
     }  else {
       if ((ss % 2) == 0) { 
-        sprintf(timeString, "%02d:%02d.%02d %c", lhh, mm, ss, TZ[selectTZ][0]);
+        sprintf(timeString, "%02d:%02d:%02d %c", lhh, mm, ss, TZ[selectTZ][0]);
       } else {
-        sprintf(timeString, "%02d %02d.%02d %c", lhh, mm, ss, TZ[selectTZ][0]);
+        sprintf(timeString, "%02d %02d:%02d %c", lhh, mm, ss, TZ[selectTZ][0]);
       }
       Serial.print(timeString);
       if (dst == 1) { Serial.print("D"); } else { Serial.print("S"); }
       Serial.println("T ");
     }
 
-   /******************************************************************************************
-    * frame error indicator - serves as signal indicator - arduino serves as clock
-    * during the noisy parts of the day, as it starts picking up WWVB frames, it syncs
-    * to NIST time.
-    * 1. Continuous full block indicates time as accurate as propagation delay will allow. 
-    * 2. Block and half block alternating. Signal is degrading, sync update when block shows.
-    * 3. Half block, 5 or less sequential frame errors, low bar more than 5 frame errors. 
-    * 4. Low bar continuous, poor WWVB signal, no sync. Running on microprocessor clock only.
-    ******************************************************************************************/
-#if 0
-   if (frameError == 1 && errorCount < 5) {           // five or less sequential frame errors
-      Serial.print("?1"); 
-    } else if (frameError == 1 & errorCount >= 5) {   // more than 5 frame errors
-      Serial.print("?0");
-    } else {
-      Serial.print("?2");                             // clear signal reception
-    }
-  
-    Serial.print("?x00?y1");       // ANSI Standard YYYYMMDD Sortable date string
-
-    if (displayUTC == 1) {         // UTC can directly use month & day
-       //Serial.print(dateString, "%04d%02d%02d ", year, mon, day);
-       //Serial.print(dateString);
-       // Display temperature in degrees Celsus
-       //sprintf(tempString, "%3d.%1d?3C",  tempout, tempoutd);
-       //Serial.print(tempString);
-    } else if (lhh < dayxing) {    // Local time can use date info up to UTC date crossing
-       //Serial.printf(dateString, "%04d%02d%02d ", year, mon, day);
-       //Serial.print(dateString);
-       // Display temperature in degrees Celsus
-       //sprintf(tempString, "%3d.%1d?3C",  tempout, tempoutd);
-       //Serial.print(tempString);
-    } else {                       // Delay change of date till 00hrs local
-       //Serial.printf(dateString, "%04d%02d%02d ", year, prevmon, prevday);
-       //Serial.print(dateString);
-       // Display temperature in degrees Celsus
-       //sprintf(tempString, "%3d.%1d?3C",  tempout, tempoutd);
-       //Serial.print(tempString);
-    }
-#endif
     if(!clockStarted)
       previousLowTime = millis();
     clockStarted = 1;
