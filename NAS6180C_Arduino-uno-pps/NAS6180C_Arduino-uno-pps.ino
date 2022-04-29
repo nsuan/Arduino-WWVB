@@ -109,8 +109,8 @@ bool interruptTick = true;         //stop interupt updates
 
 
 //filtering
-
-int offsets[32];
+#define OFFSETS_MAX 64
+int offsets[OFFSETS_MAX];
 int offsetPtr = 0;
 
 //PPS handling
@@ -235,16 +235,17 @@ void loop(void) {
       if(doPPS) {
           offsets[offsetPtr] = ppsOffset;
           offsetPtr++;
-          if(offsetPtr > 31) 
+          if(offsetPtr > (OFFSETS_MAX-1)) 
             offsetPtr = 0;
+          //populate the result array with the first result, then let the PPS offset 
           if(!haveAverage) {
-             for(int i = 0; i < 32 ; i++) 
+             for(int i = 0; i < OFFSETS_MAX ; i++) 
              offsets[i] = ppsOffset;
              haveAverage = true;
           }
-          for(int i = 0; i < 32 ; i++) 
+          for(int i = 0; i < OFFSETS_MAX ; i++) 
             offsetsum += offsets[i];
-          ppsOffsetAvg =  offsetsum / 32;
+          ppsOffsetAvg =  offsetsum / OFFSETS_MAX;
           Serial.print("- (");
           doPPS = false;
           Serial.print( ppsOffset, DEC); 
@@ -260,6 +261,7 @@ void loop(void) {
   }
   if(inPPS && tickCounter >= (ppsOffsetAvg + PPS_MS)) {
     digitalWrite(PPS_OUT, LOW);
+    inPPS = false;
   }  
   if (wwvbSignalState != previousSignalState) {  // upon WWVB receiver signal change
     scanSignal();                                // decode receiver data
@@ -352,7 +354,7 @@ void int0handler() {
   if (clockStarted && wwvbSignalState < previousSignalState) {    // upon seconds change
     curLowTime = millis();
     if ( curLowTime - previousLowTime  >= 900) {
-      if( curLowTime - previousLowTime  >= 990 < 1010) {
+      if( (curLowTime - previousLowTime)  >= 990 && (curLowTime - previousLowTime) < 1010) {
           if(tickCounter <= 500) {
              doPPS = true;
              ppsOffset = tickCounter; 
